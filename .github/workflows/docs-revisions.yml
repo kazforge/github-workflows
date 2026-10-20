@@ -1,0 +1,280 @@
+name: Documentation revisions
+
+on:
+  workflow_call:
+    inputs:
+      app-client-id:
+        description: Release GitHub App client ID
+        required: true
+        type: string
+    secrets:
+      app-private-key:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      !github.event.deleted && !github.event.forced
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.scope.outputs.tag }}
+      mode: ${{ steps.scope.outputs.mode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: scope
+        name: Check push scope and released version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BEFORE" =~ ^[a-f0-9]{40}$ && ! "$BEFORE" =~ ^0+$ ]] || exit 0
+          git merge-base --is-ancestor "$BEFORE" "$GITHUB_SHA"
+          git diff --no-renames --name-only -z "$BEFORE" "$GITHUB_SHA" > "$RUNNER_TEMP/docs-paths"
+          mapfile -d '' -t paths < "$RUNNER_TEMP/docs-paths"
+          ((${#paths[@]})) || exit 0
+          mode=docs
+          for path in "${paths[@]}"; do
+            [[ "$path" == docs/site/* ]] || { mode=; break; }
+          done
+          caller=.github/workflows/docs-revisions.yml
+          if [[ -z "$mode" && "${#paths[@]}" == 1 && "${paths[0]}" == "$caller" ]] &&
+             [[ -z "$(git log -1 --format=%H "$BEFORE" -- "$caller")" ]]; then
+            mode=bootstrap
+          fi
+          [[ -n "$mode" ]] || exit 0
+          tag="v$(jq -er '.["."] | select(type == "string")' .release-please-manifest.json)"
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ "$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)" == "$tag" ]]
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.mode != ''
+    runs-on: ubuntu-latest
+    concurrency:
+      group: docs-${{ github.repository }}-${{ needs.prepare.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            jsonapi-docs
+          permission-contents: write
+      - name: Verify, append and notify
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          DOCS_TAG: ${{ needs.prepare.outputs.tag }}
+          MODE: ${{ needs.prepare.outputs.mode }}
+        shell: python3 {0}
+        run: |
+          import hashlib
+          import io
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tarfile
+          import tempfile
+
+          def git(*args):
+              return subprocess.check_output(["git", *args])
+
+          def gh(*args):
+              return subprocess.check_output(["gh", *args])
+
+          def api(endpoint):
+              return json.loads(gh("api", endpoint))
+
+          def require(condition, message):
+              if not condition:
+                  raise ValueError(message)
+
+          def ancestor(base, head):
+              git("merge-base", "--is-ancestor", base, head)
+
+          def check_history(base, head):
+              # Inspect effective merges, not individual commits on PR side branches.
+              history = git("rev-list", "--first-parent", head).decode().splitlines()
+              require(base in history, "Docs source is not on main's first-parent history")
+              for commit in history[:history.index(base)]:
+                  paths = git("diff", "--no-renames", "--name-only", "-z", commit + "^", commit).split(b"\0")[:-1]
+                  if any(p.startswith(b"docs/site/") for p in paths):
+                      require(all(p.startswith(b"docs/site/") for p in paths),
+                              "Unpublished mixed docs/software change")
+
+          def tree(source):
+              files = {}
+              for entry in git("ls-tree", "-rz", source + ":docs/site").split(b"\0")[:-1]:
+                  metadata, name = entry.split(b"\t", 1)
+                  mode, kind, blob = metadata.split()
+                  require(mode in (b"100644", b"100755") and kind == b"blob",
+                          "Docs must contain only regular files (no symlinks/submodules)")
+                  files[name.decode()] = (mode, git("cat-file", "blob", blob.decode()))
+              require("index.md" in files, "Missing docs/site/index.md")
+              return files
+
+          def archive(source):
+              files = tree(source)
+              require("nav.yml" in files, "Missing docs/site/nav.yml")
+              with tempfile.TemporaryDirectory() as directory:
+                  root = Path(directory)
+                  for name, (mode, data) in files.items():
+                      path = root / name
+                      path.parent.mkdir(parents=True, exist_ok=True)
+                      path.write_bytes(data)
+                      path.chmod(0o755 if mode == b"100755" else 0o644)
+                  raw = subprocess.check_output([
+                      "tar", "-C", directory, "--format=gnu", "--sort=name", "--mtime=@0",
+                      "--owner=0", "--group=0", "--numeric-owner", "--mode=u+rwX,go+rX,go-w",
+                      "-cf", "-", "."])
+              return subprocess.check_output(["gzip", "-n"], input=raw)
+
+          def assets(repo, release, software, head):
+              # Use the paginated assets endpoint: embedded release assets can be truncated.
+              listed = gh("api", "--paginate", f"repos/{repo}/releases/{release['id']}/assets?per_page=100",
+                          "--jq", ".[] | @json")
+              revisions, sources = {}, set()
+              for line in listed.splitlines():
+                  asset = json.loads(line)
+                  name = asset["name"]
+                  if not name.startswith("docs-site"):
+                      continue
+                  match = re.fullmatch(r"docs-site-r([1-9][0-9]*)\.tar\.gz", name)
+                  require(name == "docs-site.tar.gz" or match, "Malformed docs asset name")
+                  number = int(match[1]) if match else 0
+                  require(number not in revisions, "Duplicate docs revision")
+                  label = re.fullmatch(r"docs-source-sha=([a-f0-9]{40});software-tag-sha=([a-f0-9]{40})",
+                                       asset.get("label") or "")
+                  require(label and label[2] == software, "Invalid docs provenance label")
+                  require(asset["state"] == "uploaded" and asset["size"] > 0, "Incomplete docs asset")
+                  docs_source = label[1]
+                  require(docs_source not in sources, "Duplicate docs source")
+                  sources.add(docs_source)
+                  ancestor(software, docs_source)
+                  ancestor(docs_source, head)
+                  revisions[number] = asset
+              require(0 in revisions, "Missing original docs-site.tar.gz")
+              previous = software
+              for _, asset in sorted(revisions.items()):
+                  ancestor(previous, source(asset))
+                  previous = source(asset)
+              return revisions
+
+          def source(asset):
+              return asset["label"].split(";", 1)[0].split("=", 1)[1]
+
+          def verify(repo, asset, expected=None):
+              data = gh("api", f"repos/{repo}/releases/assets/{asset['id']}",
+                        "-H", "Accept: application/octet-stream")
+              if asset.get("digest"):
+                  require(asset["digest"] == "sha256:" + hashlib.sha256(data).hexdigest(),
+                          "Docs asset digest mismatch")
+              if expected is not None:
+                  require(data == expected, "Docs revision bytes conflict with source")
+              else:
+                  # Legacy originals may have different tar modes; compare contents without extraction.
+                  files = tree(source(asset))
+                  seen = set()
+                  with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as packed:
+                      for member in packed:
+                          name = member.name.removeprefix("./")
+                          if member.isdir():
+                              require(name in ("", ".") or any(p.startswith(name + "/") for p in files),
+                                      "Unexpected original archive directory")
+                              continue
+                          require(member.isfile() and name in files and name not in seen,
+                                  "Invalid or duplicate original archive entry")
+                          require(packed.extractfile(member).read() == files[name][1],
+                                  "Original archive conflicts with source")
+                          seen.add(name)
+                  require(seen == files.keys(), "Original archive missing source files")
+
+          def publish():
+              repo, head, tag = (os.environ[key] for key in ("GITHUB_REPOSITORY", "GITHUB_SHA", "DOCS_TAG"))
+              def current_release():
+                  latest = api(f"repos/{repo}/releases/latest")
+                  require(latest["tag_name"] == tag and not latest["draft"] and
+                          not latest["prerelease"] and latest.get("published_at"),
+                          "Latest software release changed or is not published")
+                  obj = api(f"repos/{repo}/git/ref/tags/{tag}")["object"]
+                  if obj["type"] == "tag":
+                      obj = api(f"repos/{repo}/git/tags/{obj['sha']}")["object"]
+                  require(obj["type"] == "commit" and obj["sha"] == software, "Software tag moved")
+                  return latest
+
+              def current_main():
+                  return api(f"repos/{repo}/git/ref/heads/main")["object"]["sha"] == head
+
+              if not current_main():
+                  print("Stale run; skipping.")
+                  return
+              manifest = json.loads(git("show", head + ":.release-please-manifest.json"))
+              require("v" + manifest["."] == tag, "Manifest/release mismatch")
+              software = git("rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}").decode().strip()
+              ancestor(software, head)
+              release = current_release()
+              revisions = assets(repo, release, software, head)
+              # Both products keep software under */src/ and examples/. Build/dependency-only
+              # maintenance is allowed; changed implementation/API/example sources are not.
+              require(not git("diff", "--name-only", software, head, "--", ":(glob)**/src/**", "examples"),
+                      "Unreleased software sources; wait for a software release")
+              original = source(revisions[0])
+              check_history(original, head)
+              for number, asset in revisions.items():
+                  verify(repo, asset, archive(source(asset)) if number else None)
+              highest = max(revisions)
+              matching = next((a for n, a in revisions.items() if n and source(a) == head), None)
+              if os.environ["MODE"] == "bootstrap" and highest and not matching:
+                  print("Initial reconciliation already completed.")
+                  return
+              if not matching and not git("diff", "--name-only", source(revisions[highest]), head, "--", "docs/site"):
+                  print("Documentation already matches the published snapshot.")
+                  return
+              data = archive(head)
+              label = f"docs-source-sha={head};software-tag-sha={software}"
+              # Recheck immediately before writing, including writers outside our lock.
+              require(current_release()["id"] == release["id"], "Release replaced")
+              require(assets(repo, release, software, head) == revisions, "Release assets changed")
+              if not current_main():
+                  print("Run became stale; skipping.")
+                  return
+              if not matching:
+                  name = f"docs-site-r{highest + 1}.tar.gz"
+                  with tempfile.TemporaryDirectory() as directory:
+                      path = Path(directory) / name
+                      path.write_bytes(data)
+                      gh("release", "upload", tag, f"{path}#{label}", "--repo", repo)
+                  updated = assets(repo, release, software, head)
+                  require({n: a for n, a in updated.items() if n != highest + 1} == revisions,
+                          "Historical assets changed during upload")
+                  matching = updated[highest + 1]
+              require(matching["label"] == label, "Published provenance mismatch")
+              verify(repo, matching, data)
+              require(current_release()["id"] == release["id"], "Release changed after upload")
+              if current_main():
+                  gh("api", "--method", "POST", f"repos/{repo.split('/')[0]}/jsonapi-docs/dispatches",
+                     "-f", "event_type=docs-release-published")
+
+          if __name__ == "__main__":
+              publish()
