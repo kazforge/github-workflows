@@ -1,0 +1,19 @@
+# Local IDE metadata
+.idea/
+*.iml
+.vscode/
+
+# Python caches and local virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local environment files; keep the example shareable
+.env
+.env.*
+!.env.example
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
