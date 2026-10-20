@@ -61,7 +61,7 @@ else
 fi
 
 # One packaging, upload, verification and notification path for both modes.
-[[ -f docs/site/index.md ]]
+[[ -f docs/site/index.md && -f docs/site/nav.yml ]]
 git ls-tree -r HEAD:docs/site > "$RUNNER_TEMP/docs-tree"
 if grep -qEv '^100(644|755) blob ' "$RUNNER_TEMP/docs-tree"; then exit 1; fi
 archive="$RUNNER_TEMP/$name"
