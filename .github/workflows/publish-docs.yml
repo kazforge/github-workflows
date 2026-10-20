@@ -1,0 +1,84 @@
+name: Publish documentation
+
+on:
+  workflow_call:
+    inputs:
+      release-tag:
+        description: Software release tag; omit for a docs-only main update
+        type: string
+        default: ''
+      app-client-id:
+        required: true
+        type: string
+    secrets:
+      app-private-key:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: >-
+      inputs.release-tag != '' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      !github.event.deleted && !github.event.forced)
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release-tag || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: product
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          persist-credentials: false
+          path: shared
+      - id: prepare
+        working-directory: product
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          BEFORE: ${{ github.event.before }}
+        run: bash ../shared/scripts/publish-docs.sh prepare
+
+  publish:
+    needs: prepare
+    if: needs.prepare.outputs.tag != ''
+    runs-on: ubuntu-latest
+    concurrency:
+      group: docs-${{ github.repository }}-${{ needs.prepare.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release-tag || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: product
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          persist-credentials: false
+          path: shared
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            ${{ github.event.repository.name }}
+            jsonapi-docs
+          permission-contents: write
+      - name: Publish and notify Portal
+        working-directory: product
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: bash ../shared/scripts/publish-docs.sh publish

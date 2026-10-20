@@ -1,15 +1,36 @@
-# Documentation revisions
+# Publish documentation
 
-Append docs-only corrections to an existing software release using the same App,
-tar/gzip, immutable upload, verification and dispatch pattern as product release
-jobs. Product reviews own compatibility with the released software; the Portal
-owns comprehensive verification of historical documentation assets.
+One workflow with two modes: supply `release-tag` to publish `docs-site.tar.gz`
+from that software tag, or omit it to append `docs-site-rN.tar.gz` after an
+effective docs-only push to main, using the root Release Please manifest version.
 
-Required input: `app-client-id`. Required explicit secret: `app-private-key`.
-The caller needs `contents: read`; the App needs Contents-write on the product and
-`jsonapi-docs` under the same owner. Its token is limited to those repositories.
+Required input: `app-client-id`; explicit secret: `app-private-key`. Caller token:
+`contents: read`. The App token has Contents-write only on the product and
+same-owner `jsonapi-docs`. The script comes from `job.workflow_repository` at
+`job.workflow_sha` (GitHub.com); no extra ref input or inherited secrets.
 
-Use this caller in Core or Spring, pinned to a reviewed full commit SHA:
+## Consumer examples — not applied
+
+In **both Core and Spring**, replace the entire `release.yml` `docs-publish` job
+(runner, steps and concurrency) with this caller. Keep release/Maven jobs unchanged;
+the successful Central job is the release-mode gate. Pin a reviewed full shared SHA.
+
+```yaml
+  docs-publish:
+    needs: [release-please, publish]
+    if: needs.publish.result == 'success'
+    permissions:
+      contents: read
+    uses: kazforge/github-workflows/.github/workflows/publish-docs.yml@<FULL_COMMIT_SHA> # vX.Y.Z
+    with:
+      release-tag: ${{ needs.release-please.outputs.tag_name }}
+      app-client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+    secrets:
+      app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+```
+
+Replace each Docs Revision draft PR's publisher with this separate
+`.github/workflows/docs-revisions.yml`. No installation trigger or caller-level lock:
 
 ```yaml
 on:
@@ -20,34 +41,52 @@ permissions:
   contents: read
 jobs:
   docs:
-    uses: kazforge/github-workflows/.github/workflows/docs-revisions.yml@<FULL_COMMIT_SHA> # vX.Y.Z
+    uses: kazforge/github-workflows/.github/workflows/publish-docs.yml@<FULL_COMMIT_SHA> # vX.Y.Z
     with:
       app-client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
     secrets:
       app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 ```
 
-Only nonempty, effective docs-only pushes qualify. The manifest identifies the
-latest stable published release; a unique uploaded original with exact source/tag
-provenance is mandatory, including valid post-tag originals. Revisions use the
-highest numeric suffix plus one (gaps allowed), never replace assets, and verify
-the candidate's labels and downloaded bytes before payload-free Portal dispatch.
-Retries reuse the source-labelled asset and notify even if main/release advances.
-The native per-release lock matches product publishing. Tags/assets must not be
-manually mutated; ref checks and uploads cannot be atomic. Roll back through a
-reviewed docs revert published as a new revision, not asset replacement.
+## Safety and policy approval
 
-**PO approval required — contract change:** automatic bootstrap and unpublished
-history analysis are removed; historical provenance verification is delegated to
-the Portal. Eligibility covers only the triggering push; product review must
-account for all documentation included in the snapshot.
-After the Portal consumer is deployed and validated, install the pinned caller,
-then merge a small, meaningful, reviewed docs-only follow-up correcting/confirming
-the pending released-version guides. Pilot Spring v0.1.0, verify its revision and
-Portal build, then repeat for Core v0.4.0. Caller installation alone publishes
-nothing. No permanent manual trigger is provided; this procedure is proposed,
-not executed.
+Tag, manifest and live software SHA must agree. Both modes require a stable
+published GitHub release; docs updates additionally require a valid original
+(post-tag sources supported), current main and latest release for new uploads.
+Incomplete expected releases never fall back. Numeric gaps are allowed.
+Both modes share deterministic regular-file-only packaging (`index.md` required),
+the existing `docs-REPOSITORY-TAG` lock and candidate label/byte verification before
+payload-free `docs-release-published`. Retries notify even after main/release
+advances; conflicts/partial candidates fail closed. Never replace legacy originals.
+Rollback is a reviewed docs revert/new revision. Manual tag/asset mutation is
+outside the lock; ref-check/upload is not atomic.
 
-Local checks: `bash tests/docs-revisions.sh`, ShellCheck and actionlint. Smoke tests
-exercise local scope/selection/packaging and check retry/dispatch control flow;
-real GitHub queue, token and dispatch integration still needs an approved pilot.
+**PO approval:** scope expands to replacing release docs publishing; the entry point
+becomes `publish-docs.yml` with optional `release-tag`. Bootstrap/history scanners
+remain removed. Portal owns final asset validation; product reviews own full-snapshot
+software compatibility. Builds/Maven/other CI stay local; migrations need approval.
+
+## Validation and integration plan
+
+Local: `bash -n scripts/publish-docs.sh`, ShellCheck and actionlint (1.7.12 needs only
+the four documented `job.workflow_*` property diagnostics ignored). No test harness.
+
+Before production, approve this unexecuted plan using a disposable product, isolated
+App and `jsonapi-docs` receiver under a **separate owner**, never production credentials:
+
+1. Pin this SHA. Create a synthetic manifest/tag/published release after a simulated
+   Central success. Release mode must produce the original, exact SHA labels/bytes
+   and a payload-free event; rerun must reuse the asset and repeat dispatch.
+2. Make a docs-only push: verify `r1`, unchanged original and event. Confirm mixed
+   pushes skip and missing-original/incomplete-new-release cases never update an
+   older release. Check numeric gaps and both tag-aligned/post-tag original sources.
+3. Interrupt after upload acceptance, then rerun; no duplicate. Fail dispatch, advance
+   main and subsequently the manifest/release, then rerun the old job: verify bytes
+   and recovered dispatch without upload. Check conflicting labels/bytes fail closed.
+4. Queue both callers for the same tag; verify serialization and stale-new-run skips.
+   Retain asset IDs/digests and receiver events as evidence.
+
+After evidence and Portal deployment/validation, approve migration. Pilot Spring,
+then Core; reconcile pending v0.1.0/v0.4.0 guides through a meaningful reviewed
+docs-only follow-up after caller installation, reviewing the full snapshot. No
+bootstrap/manual trigger, production rollout or consumer edits were performed.
