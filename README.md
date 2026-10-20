@@ -1,20 +1,21 @@
-# Shared documentation revision publisher
+# Documentation revisions
 
-Append docs-only corrections to an existing software release without rebuilding
-software or replacing its original `docs-site.tar.gz`. Core and Spring use the
-same workflow; product reviews own compatibility with the released software.
+Append docs-only corrections to an existing software release using the same App,
+tar/gzip, immutable upload, verification and dispatch pattern as product release
+jobs. Product reviews own compatibility with the released software; the Portal
+owns comprehensive verification of historical documentation assets.
 
-Required: `app-client-id`, explicit `app-private-key` secret and caller
-`contents: read`. The App needs Contents-write on the product and `jsonapi-docs`
-under the same owner; its token is limited to those two repositories.
+Required input: `app-client-id`. Required explicit secret: `app-private-key`.
+The caller needs `contents: read`; the App needs Contents-write on the product and
+`jsonapi-docs` under the same owner. Its token is limited to those repositories.
 
-Use this caller as `.github/workflows/docs-revisions.yml` in either product:
+Use this caller in Core or Spring, pinned to a reviewed full commit SHA:
 
 ```yaml
 on:
   push:
     branches: [main]
-    paths: ['docs/site/**', '.github/workflows/docs-revisions.yml']
+    paths: ['docs/site/**']
 permissions:
   contents: read
 jobs:
@@ -26,30 +27,27 @@ jobs:
       app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 ```
 
-Pin a reviewed full SHA. The shared script is checked out at the defining job's
-immutable SHA, separately from the triggering product commit (GitHub.com only).
-Merge only the new caller file for automatic first-install reconciliation; caller
-updates/reintroductions do not reopen it. Deploy the Portal revision consumer first.
+Only nonempty, effective docs-only pushes qualify. The manifest identifies the
+latest stable published release; a unique uploaded original with exact source/tag
+provenance is mandatory, including valid post-tag originals. Revisions use the
+highest numeric suffix plus one (gaps allowed), never replace assets, and verify
+the candidate's labels and downloaded bytes before payload-free Portal dispatch.
+Retries reuse the source-labelled asset and notify even if main/release advances.
+The native per-release lock matches product publishing. Tags/assets must not be
+manually mutated; ref checks and uploads cannot be atomic. Roll back through a
+reviewed docs revert published as a new revision, not asset replacement.
 
-The manifest version must identify the latest published stable release, with a
-unique uploaded original and exact `docs-source-sha=…;software-tag-sha=…` labels.
-Sources must follow the software tag, remain on main and follow numeric revision
-order; a post-tag original is valid. New docs and unpublished docs-affecting merges
-must be docs-only. Guides require `index.md`, `nav.yml` and no symlinks/submodules.
+**PO approval required — contract change:** automatic bootstrap and unpublished
+history analysis are removed; historical provenance verification is delegated to
+the Portal. Eligibility covers only the triggering push; product review must
+account for all documentation included in the snapshot.
+After the Portal consumer is deployed and validated, install the pinned caller,
+then merge a small, meaningful, reviewed docs-only follow-up correcting/confirming
+the pending released-version guides. Pilot Spring v0.1.0, verify its revision and
+Portal build, then repeat for Core v0.4.0. Caller installation alone publishes
+nothing. No permanent manual trigger is provided; this procedure is proposed,
+not executed.
 
-Revisions append above the highest verified number; gaps are allowed. Historical
-assets get metadata/ancestry checks, not archive reconstruction. Only the candidate
-upload/retry gets downloaded by ID and byte-compared to its deterministic archive.
-Two jobs preserve the release publisher's `docs-REPOSITORY-TAG` lock. Stale runs
-cannot upload, but verified uploads always dispatch, even after main advances.
-Dispatch retries are at-least-once; the Portal must be idempotent. Conflicting or
-partial assets fail closed and require investigation, never automatic replacement.
-
-Rollback means a reviewed docs revert published as the next revision. Never replace
-assets or move tags. The lock coordinates cooperating publishers, not manual edits;
-GitHub cannot atomically check main and upload. No product pipelines are migrated.
-
-Validate locally: `bash tests/docs-revisions.sh`, `bash -n scripts/docs-revisions.sh`
-and `actionlint .github/workflows/docs-revisions.yml` (when installed).
-Actionlint 1.7.12 does not yet recognize the documented `job.workflow_*` contexts;
-ignore only those property diagnostics, not other expression errors.
+Local checks: `bash tests/docs-revisions.sh`, ShellCheck and actionlint. Smoke tests
+exercise local scope/selection/packaging and check retry/dispatch control flow;
+real GitHub queue, token and dispatch integration still needs an approved pilot.
